@@ -1,0 +1,81 @@
+#!/bin/bash
+set -euo pipefail
+
+echo "installing docker"
+dnf install -y docker
+systemctl enable --now docker
+
+install -d /opt/vpc-health
+
+cat > /opt/vpc-health/package.json << 'EOF_PACKAGE'
+${package_json}
+EOF_PACKAGE
+
+cat > /opt/vpc-health/server.js << 'EOF_SERVER'
+${server_js}
+EOF_SERVER
+
+cat > /opt/vpc-health/Dockerfile << 'EOF_DOCKER'
+${dockerfile}
+EOF_DOCKER
+
+cd /opt/vpc-health
+
+built=0
+for _ in 1 2 3; do
+  if docker build -t vpc-health:local .; then
+    built=1
+    break
+  fi
+  echo "docker build failed, retrying"
+  sleep 15
+done
+test "$built" = 1
+
+start_container() {
+  local driver="$1"
+  docker rm -f vpc-health >/dev/null 2>&1 || true
+  if [ "$driver" = "awslogs" ]; then
+    docker run -d \
+      --name vpc-health \
+      --restart unless-stopped \
+      --log-driver awslogs \
+      --log-opt awslogs-region="${aws_region}" \
+      --log-opt awslogs-group="${log_group}" \
+      --log-opt awslogs-stream=app \
+      -p 80:8080 \
+      vpc-health:local
+  else
+    docker run -d \
+      --name vpc-health \
+      --restart unless-stopped \
+      -p 80:8080 \
+      vpc-health:local
+  fi
+}
+
+started=0
+for _ in 1 2 3 4 5; do
+  if start_container awslogs; then
+    started=1
+    break
+  fi
+  echo "awslogs start failed, retrying"
+  sleep 5
+done
+
+if [ "$started" != 1 ]; then
+  echo "falling back to the local docker log driver"
+  start_container local
+fi
+
+attempt=0
+until curl -fsS http://127.0.0.1/health; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 30 ]; then
+    echo "health check did not pass" >&2
+    docker logs vpc-health >&2 || true
+    exit 1
+  fi
+  sleep 2
+done

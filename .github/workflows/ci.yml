@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: What to run in the sandbox AWS account
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Test, image, Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test the app
+        working-directory: app
+        run: npm test
+
+      - name: Build the image
+        run: docker build -t vpc-health:ci app
+
+      - name: Install Terraform
+        run: |
+          curl -fsSL -o /tmp/terraform.zip "https://releases.hashicorp.com/terraform/1.17.2/terraform_1.17.2_linux_amd64.zip"
+          sudo unzip -o /tmp/terraform.zip -d /usr/local/bin
+          terraform version
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive infra
+
+      - name: Validate Terraform
+        working-directory: infra
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+  aws:
+    name: Terraform ${{ github.event.inputs.action || 'plan' }}
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require AWS settings
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          test -n "$AWS_ROLE_ARN" || { echo "Set repository variable AWS_ROLE_ARN."; exit 1; }
+          test -n "$TF_STATE_BUCKET" || { echo "Set repository variable TF_STATE_BUCKET."; exit 1; }
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Install Terraform
+        run: |
+          curl -fsSL -o /tmp/terraform.zip "https://releases.hashicorp.com/terraform/1.17.2/terraform_1.17.2_linux_amd64.zip"
+          sudo unzip -o /tmp/terraform.zip -d /usr/local/bin
+          terraform version
+
+      - name: Point Terraform at the state bucket
+        working-directory: infra
+        run: |
+          cat > backend.tf <<'EOF'
+          terraform {
+            backend "s3" {}
+          }
+          EOF
+          cat > backend.hcl <<EOF
+          bucket       = "${{ vars.TF_STATE_BUCKET }}"
+          key          = "aws-vpc-health/terraform.tfstate"
+          region       = "ap-south-1"
+          encrypt      = true
+          use_lockfile = true
+          EOF
+
+      - name: Init
+        working-directory: infra
+        run: terraform init -input=false -backend-config=backend.hcl
+
+      - name: Plan, apply, or destroy
+        working-directory: infra
+        run: |
+          case "${{ github.event.inputs.action }}" in
+            plan) terraform plan -input=false ;;
+            apply) terraform apply -input=false -auto-approve ;;
+            destroy) terraform destroy -input=false -auto-approve ;;
+            *) echo "Unknown action"; exit 1 ;;
+          esac

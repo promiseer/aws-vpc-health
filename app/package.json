@@ -1,0 +1,10 @@
+{
+  "name": "vpc-health",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Small HTTP app used to demo a Terraform VPC and a container on EC2.",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  }
+}
