@@ -53,7 +53,7 @@ jobs:
           terraform validate
 
   aws:
-    name: Terraform ${{ github.event.inputs.action || 'plan' }}
+    name: Terraform plan, apply, or destroy
     if: github.event_name == 'workflow_dispatch'
     needs: verify
     runs-on: ubuntu-latest
